@@ -242,88 +242,43 @@ class Experiment:
         return res
 
 
-def make_app(csv_path="archetypes.csv", optimise=False, n_agents=50):
-    from dash import Dash, dcc, html, Input, Output
+def make_app(
+    csv_path="archetypes.csv",
+    csv_path_h1="archetypes_h1.csv",
+    optimise=False,
+    n_agents=50,
+):
+    from dash import Dash, dcc, html, Input, Output, State, dash_table
     import plotly.graph_objects as go
+    import numpy as np
+    import pandas as pd
+    import random
 
-    community = build_community_from_archetypes(csv_path, n_agents=n_agents)
-    app = Dash(__name__)
-    app.layout = html.Div(
-        [
-            html.H3("Community V2X Simulation — Per-Day Plug and Drive Probabilities"),
-            dcc.Slider(
-                id="n_agents",
-                min=5,
-                max=n_agents,
-                step=5,
-                value=n_agents,
-                tooltip={"always_visible": True},
-            ),
-            dcc.Graph(id="soc_graph"),
-            dcc.Dropdown(id="agent_selector", placeholder="Select agent to view"),
-            dcc.Graph(id="agent_soc_graph"),
-            dcc.Graph(id="load_graph"),
-        ]
-    )
+    df_base = pd.read_csv(csv_path)
+    df_base_h1 = pd.read_csv(csv_path_h1)
 
-    @app.callback(
-        [
-            Output("soc_graph", "figure"),
-            Output("load_graph", "figure"),
-            Output("agent_selector", "options"),
-            Output("agent_selector", "value"),
-        ],
-        Input("n_agents", "value"),
-    )
-    def update_graphs(n_agents):
-        comm = build_community_from_archetypes(csv_path, n_agents=n_agents)
-        exp = Experiment(
-            name="Per-Day Plug/Drive Simulation",
-            hypothesis="Charging and driving sampled per day",
-            independent_vars={"n_agents": n_agents},
-            control_vars={"time_steps": 96, "dt_h": 0.25},
-        )
-        res = exp.run(comm, optimise=optimise)
-        t = res["time"]
+    # ---------- Helper function for SoC figure ----------
+    def build_soc_fig(res, title):
+        t = np.array(res["time"])
+        soc_matrix = np.array(res["soc_matrix"])
+        mean_soc = soc_matrix.mean(axis=0)
+        p2p5 = np.percentile(soc_matrix, 2.5, axis=0)
+        p97p5 = np.percentile(soc_matrix, 97.5, axis=0)
+        pct_plugged = np.array(res["pct_plugged"])
 
-        # --- Compute percentiles across agents for SoC ---
-        soc_matrix = np.vstack([ares["soc"] for ares in res["agents"].values()])
-        mean_soc = soc_matrix.mean(axis=0) * 100
-        p2p5 = np.percentile(soc_matrix * 100, 2.5, axis=0)
-        p97p5 = np.percentile(soc_matrix * 100, 97.5, axis=0)
-
-        # --- Compute % plugged in ---
-        plug_matrix = np.vstack([ares["plug_mask"] for ares in res["agents"].values()])
-        pct_plugged = plug_matrix.mean(axis=0) * 100
-
-        # --- Build figure with shaded percentiles + bars ---
-        soc_fig = go.Figure()
-
-        # Add shaded confidence interval (fill between percentiles)
-        soc_fig.add_trace(
-            go.Scatter(
-                x=t,
-                y=p97p5,
-                line=dict(width=0),
-                mode="lines",
-                name="97.5th percentile",
-                showlegend=False,
-            )
-        )
-        soc_fig.add_trace(
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t, y=p97p5, line=dict(width=0), showlegend=False))
+        fig.add_trace(
             go.Scatter(
                 x=t,
                 y=p2p5,
                 line=dict(width=0),
-                mode="lines",
                 fill="tonexty",
-                fillcolor="rgba(0, 100, 250, 0.2)",
-                name="2.5–97.5 percentile range",
+                fillcolor="rgba(0,100,250,0.2)",
+                name="95% range",
             )
         )
-
-        # Add mean SoC line
-        soc_fig.add_trace(
+        fig.add_trace(
             go.Scatter(
                 x=t,
                 y=mean_soc,
@@ -332,82 +287,432 @@ def make_app(csv_path="archetypes.csv", optimise=False, n_agents=50):
                 line=dict(color="blue", width=2),
             )
         )
-
-        # Add bars for % plugged in (secondary y-axis)
-        soc_fig.add_trace(
+        fig.add_trace(
             go.Bar(
                 x=t,
                 y=pct_plugged,
-                name="% Plugged In",
-                marker_color="rgba(0, 200, 0, 0.4)",
+                name="% Charging",
+                marker_color="rgba(0,200,0,0.4)",
                 yaxis="y2",
             )
         )
-
-        # Layout with dual y-axis: left = SoC, right = % plugged in
-        soc_fig.update_layout(
-            title="Average State of Charge (%) with 95% Range & Plugged-in %",
+        fig.update_layout(
+            title=title,
             xaxis_title="Hour",
             yaxis=dict(title="SoC %", range=[0, 100]),
             yaxis2=dict(
-                title="% Plugged In",
-                overlaying="y",
-                side="right",
-                range=[0, 100],
-                showgrid=False,
+                title="% Charging", overlaying="y", side="right", range=[0, 100]
             ),
             barmode="overlay",
             bargap=0,
         )
+        return fig
 
-        # Load graph (kW, not percentage)
-        load_fig = go.Figure(go.Scatter(x=t, y=res["agg_load"], mode="lines"))
-        load_fig.update_layout(
-            title="Aggregate Demand (kW)", xaxis_title="Hour", yaxis_title="kW"
-        )
+    app = Dash(__name__)
 
-        options = [
-            {"label": f"Agent {aid} — {comm.agents[aid].archetype_name}", "value": aid}
-            for aid in range(len(comm.agents))
+    # ---- Layout ----
+    app.layout = html.Div(
+        [
+            # Stores to cache results
+            dcc.Store(id="res1_store"),
+            dcc.Store(id="res2_store"),
+            html.H2("1️⃣ Experiment Setup"),
+            html.P(
+                "Compare and modify archetype inputs for Experiment 2 below. Adjust population shares, plug-in times, and frequencies to explore different scenarios."
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H4("Experiment 1: Original Archetypes"),
+                            dash_table.DataTable(
+                                id="archetype_table_exp1",
+                                columns=[{"name": c, "id": c} for c in df_base.columns],
+                                data=df_base.to_dict("records"),
+                                editable=False,
+                                style_table={"overflowX": "auto"},
+                                style_cell={"minWidth": "80px", "textAlign": "center"},
+                            ),
+                        ],
+                        style={
+                            "width": "45%",
+                            "display": "inline-block",
+                            "backgroundColor": "#f5f8ff",
+                            "padding": "10px",
+                            "borderRadius": "8px",
+                        },
+                    ),
+                    html.Div(
+                        style={
+                            "display": "inline-block",
+                            "width": "2%",
+                            "backgroundColor": "#ccc",
+                            "margin": "0 1%",
+                            "borderRadius": "4px",
+                        }
+                    ),
+                    html.Div(
+                        [
+                            html.H4("Experiment 2: Editable Archetypes"),
+                            dash_table.DataTable(
+                                id="archetype_table_exp2",
+                                columns=[
+                                    {"name": "Name", "id": "Name", "editable": False},
+                                    {
+                                        "name": "Percent of population",
+                                        "id": "Percent of population",
+                                        "type": "numeric",
+                                        "editable": True,
+                                    },
+                                    {
+                                        "name": "Plug-in frequency per day",
+                                        "id": "Plug-in frequency per day",
+                                        "type": "numeric",
+                                        "editable": True,
+                                    },
+                                    {
+                                        "name": "Plug-in time",
+                                        "id": "Plug-in time",
+                                        "editable": True,
+                                    },
+                                    {
+                                        "name": "Plug-out time",
+                                        "id": "Plug-out time",
+                                        "editable": True,
+                                    },
+                                    {
+                                        "name": "Driving frequency per day",
+                                        "id": "Driving frequency per day",
+                                        "type": "numeric",
+                                        "editable": True,
+                                    },
+                                ],
+                                data=df_base_h1.to_dict("records"),
+                                editable=True,
+                                style_table={"overflowX": "auto"},
+                                style_cell={"minWidth": "80px", "textAlign": "center"},
+                            ),
+                        ],
+                        style={
+                            "width": "45%",
+                            "display": "inline-block",
+                            "backgroundColor": "#f8fff5",
+                            "padding": "10px",
+                            "borderRadius": "8px",
+                        },
+                    ),
+                ],
+                style={"marginBottom": "20px"},
+            ),
+            html.Hr(),
+            html.H2("2️⃣ Aggregate Simulation Results"),
+            dcc.Slider(
+                id="n_agents",
+                min=5,
+                max=n_agents,
+                step=50,
+                value=100,
+                tooltip={"always_visible": True},
+            ),
+            dcc.Loading(
+                id="loading-spinner",
+                type="circle",
+                style={"position": "relative", "top": "-900px"},
+                children=html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [dcc.Graph(id="soc_graph_exp1")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingRight": "1%",
+                                    },
+                                ),
+                                html.Div(
+                                    [dcc.Graph(id="soc_graph_exp2")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingLeft": "1%",
+                                    },
+                                ),
+                            ],
+                            style={"marginBottom": "30px"},
+                        ),
+                        html.Div(
+                            [dcc.Graph(id="agg_demand_graph")],
+                            style={"marginBottom": "30px"},
+                        ),
+                        html.Hr(),
+                        html.H2("3️⃣ Key Performance Indicators"),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [dcc.Graph(id="peak_demand_chart")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingRight": "1%",
+                                    },
+                                ),
+                                html.Div(
+                                    [dcc.Graph(id="total_demand_chart")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingLeft": "1%",
+                                    },
+                                ),
+                            ],
+                            style={"marginBottom": "30px"},
+                        ),
+                        html.Hr(),
+                        html.H2("4️⃣ Individual Agent Exploration"),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Label("Experiment 1 Agent"),
+                                        dcc.Dropdown(
+                                            id="agent_selector_exp1",
+                                            placeholder="Select agent (Exp 1)",
+                                        ),
+                                    ],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingRight": "1%",
+                                    },
+                                ),
+                                html.Div(
+                                    [
+                                        html.Label("Experiment 2 Agent"),
+                                        dcc.Dropdown(
+                                            id="agent_selector_exp2",
+                                            placeholder="Select agent (Exp 2)",
+                                        ),
+                                    ],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingLeft": "1%",
+                                    },
+                                ),
+                            ]
+                        ),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [dcc.Graph(id="agent_soc_exp1")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingRight": "1%",
+                                    },
+                                ),
+                                html.Div(
+                                    [dcc.Graph(id="agent_soc_exp2")],
+                                    style={
+                                        "width": "48%",
+                                        "display": "inline-block",
+                                        "paddingLeft": "1%",
+                                    },
+                                ),
+                            ]
+                        ),
+                    ]
+                ),
+            ),
         ]
-        first_agent = options[0]["value"] if options else None
-        return soc_fig, load_fig, options, first_agent
+    )
+
+    # ---- Callbacks ----
+    from dash import ctx
 
     @app.callback(
-        Output("agent_soc_graph", "figure"),
-        [Input("agent_selector", "value"), Input("n_agents", "value")],
+        [
+            Output("soc_graph_exp1", "figure"),
+            Output("soc_graph_exp2", "figure"),
+            Output("agg_demand_graph", "figure"),
+            Output("peak_demand_chart", "figure"),
+            Output("total_demand_chart", "figure"),
+            Output("agent_selector_exp1", "options"),
+            Output("agent_selector_exp2", "options"),
+            Output("agent_selector_exp1", "value"),
+            Output("agent_selector_exp2", "value"),
+            Output("res1_store", "data"),
+            Output("res2_store", "data"),
+        ],
+        [Input("n_agents", "value"), Input("archetype_table_exp2", "data")],
     )
-    def update_agent_chart(agent_id, n_agents):
-        comm = build_community_from_archetypes(csv_path, n_agents=n_agents)
-        res = comm.simulate(time_steps=96, dt_h=0.25, optimise=optimise)
-        if agent_id not in res["agents"]:
-            return go.Figure()
-        ares = res["agents"][agent_id]
-        t = res["time"]
+    def run_and_render(n_agents_val, table_data_exp2):
+        # Import your build_community_from_archetypes & Experiment here
+        comm1 = build_community_from_archetypes(csv_path, n_agents=n_agents_val)
+        res1_raw = Experiment(
+            "Experiment 1", "Baseline", {}, {"time_steps": 96, "dt_h": 0.25}
+        ).run(comm1, optimise=optimise)
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=t, y=ares["soc"] * 100, mode="lines", name="SoC %"))
-        fig.add_trace(
-            go.Scatter(
-                x=t,
-                y=[100 if m else 0 for m in ares["plug_mask"]],
-                fill="tozeroy",
-                mode="none",
-                fillcolor="rgba(0,200,0,0.2)",
-                name="Plugged in",
-            )
-        )
-        fig.update_layout(
-            title=f"Agent {agent_id} ({comm.agents[agent_id].archetype_name}) SoC Profile",
+        # Convert to JSON-safe dict
+        res1 = {
+            "time": [float(x) for x in res1_raw["time"]],
+            "agg_load": [float(x) for x in res1_raw["agg_load"]],
+            "agents": {
+                str(k): {
+                    "soc": list(map(float, v["soc"])),
+                    "plug_mask": list(map(bool, v["plug_mask"])),
+                }
+                for k, v in res1_raw["agents"].items()
+            },
+            "soc_matrix": np.vstack(
+                [v["soc"] * 100 for v in res1_raw["agents"].values()]
+            ).tolist(),
+            "pct_plugged": (
+                np.vstack([v["plug_mask"] for v in res1_raw["agents"].values()]).mean(
+                    axis=0
+                )
+                * 100
+            ).tolist(),
+        }
+
+        df_mod = pd.DataFrame(table_data_exp2)
+        if df_mod["Percent of population"].sum() > 0:
+            df_mod["Percent of population"] = (
+                df_mod["Percent of population"] / df_mod["Percent of population"].sum()
+            ) * 100
+        temp_csv = "/tmp/experiment2.csv"
+        df_mod.to_csv(temp_csv, index=False)
+
+        comm2 = build_community_from_archetypes(temp_csv, n_agents=n_agents_val)
+        res2_raw = Experiment(
+            "Experiment 2", "User modified", {}, {"time_steps": 96, "dt_h": 0.25}
+        ).run(comm2, optimise=optimise)
+
+        res2 = {
+            "time": [float(x) for x in res2_raw["time"]],
+            "agg_load": [float(x) for x in res2_raw["agg_load"]],
+            "agents": {
+                str(k): {
+                    "soc": list(map(float, v["soc"])),
+                    "plug_mask": list(map(bool, v["plug_mask"])),
+                }
+                for k, v in res2_raw["agents"].items()
+            },
+            "soc_matrix": np.vstack(
+                [v["soc"] * 100 for v in res2_raw["agents"].values()]
+            ).tolist(),
+            "pct_plugged": (
+                np.vstack([v["plug_mask"] for v in res2_raw["agents"].values()]).mean(
+                    axis=0
+                )
+                * 100
+            ).tolist(),
+        }
+
+        soc_fig1 = build_soc_fig(res1, "Experiment 1: Avg SoC")
+        soc_fig2 = build_soc_fig(res2, "Experiment 2: Avg SoC")
+        agg_fig = go.Figure()
+        agg_fig.add_trace(go.Scatter(x=res1["time"], y=res1["agg_load"], name="Exp 1"))
+        agg_fig.add_trace(go.Scatter(x=res2["time"], y=res2["agg_load"], name="Exp 2"))
+        agg_fig.update_layout(
+            title="Aggregate Community Demand (kW)",
             xaxis_title="Hour",
-            yaxis_title="SoC %",
-            yaxis=dict(range=[0, 100]),
+            yaxis_title="kW",
         )
-        return fig
+
+        peak_fig = go.Figure(
+            [
+                go.Bar(name="Exp 1", x=["Peak Demand"], y=[max(res1["agg_load"])]),
+                go.Bar(name="Exp 2", x=["Peak Demand"], y=[max(res2["agg_load"])]),
+            ]
+        )
+        total_fig = go.Figure(
+            [
+                go.Bar(
+                    name="Exp 1", x=["Total Demand"], y=[sum(res1["agg_load"]) * 0.25]
+                ),
+                go.Bar(
+                    name="Exp 2", x=["Total Demand"], y=[sum(res2["agg_load"]) * 0.25]
+                ),
+            ]
+        )
+
+        sample_ids_1 = random.sample(
+            range(len(comm1.agents)), min(10, len(comm1.agents))
+        )
+        sample_ids_2 = random.sample(
+            range(len(comm2.agents)), min(10, len(comm2.agents))
+        )
+        options1 = [
+            {"label": f"Agent {i} — {comm1.agents[i].archetype_name}", "value": i}
+            for i in sample_ids_1
+        ]
+        options2 = [
+            {"label": f"Agent {i} — {comm2.agents[i].archetype_name}", "value": i}
+            for i in sample_ids_2
+        ]
+
+        default_val_1 = sample_ids_1[0] if sample_ids_1 else None
+        default_val_2 = sample_ids_2[0] if sample_ids_2 else None
+
+        return (
+            soc_fig1,
+            soc_fig2,
+            agg_fig,
+            peak_fig,
+            total_fig,
+            options1,
+            options2,
+            default_val_1,
+            default_val_2,
+            res1,
+            res2,
+        )
+
+    @app.callback(
+        [Output("agent_soc_exp1", "figure"), Output("agent_soc_exp2", "figure")],
+        [
+            Input("agent_selector_exp1", "value"),
+            Input("agent_selector_exp2", "value"),
+            Input("res1_store", "data"),
+            Input("res2_store", "data"),
+        ],
+    )
+    def render_agents(agent_id1, agent_id2, res1, res2):
+        def plot_agent(res, agent_id, title):
+            if not res or agent_id is None:
+                return go.Figure()
+            a = res["agents"].get(str(agent_id))
+            if a is None:
+                return go.Figure()
+            t = res["time"]
+            soc = [x * 100 if max(a["soc"]) <= 1 else x for x in a["soc"]]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=t, y=soc, name="SoC %"))
+            fig.add_trace(
+                go.Scatter(
+                    x=t,
+                    y=[100 if p else 0 for p in a["plug_mask"]],
+                    fill="tozeroy",
+                    mode="none",
+                    fillcolor="rgba(0,200,0,0.2)",
+                )
+            )
+            fig.update_layout(title=title, yaxis=dict(range=[0, 100]))
+            return fig
+
+        return plot_agent(
+            res1, agent_id1, f"Experiment 1: Agent {agent_id1}"
+        ), plot_agent(res2, agent_id2, f"Experiment 2: Agent {agent_id2}")
 
     return app
 
 
 if __name__ == "__main__":
-    app = make_app(csv_path="archetypes.csv", optimise=False, n_agents=100)
+    app = make_app(
+        csv_path="archetypes.csv",
+        optimise=False,
+        n_agents=1000,  # per experiment
+    )
     app.run(host="0.0.0.0", port=8050, debug=True)
