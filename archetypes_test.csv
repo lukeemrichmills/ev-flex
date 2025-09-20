@@ -1,0 +1,7 @@
+#,Name,Percent of population,Miles per yr,Battery kWh,Efficiency miperkWh,Plug-in frequency per day,Charger kW,Plug-in time,Plug-out time,Target SoC,kWh per year,kWh per plug-in,Plug-in SoC,SoC requirement,Charging duration hrs,Driving frequency per day
+1,Average (UK),0,9435,60,3.5,1,7,6:00 PM,7:00 AM,80%,2696,7,68%,12%,1,1
+2,Intelligent Octopus average,100,28105,72.5,3.5,1,7,6:00 PM,7:00 AM,80%,8030,22,52%,28%,2.5,1
+3,Infrequent charging,0,9435,60,3.5,0.2,7,6:00 PM,7:00 AM,80%,2696,37,18%,62%,5,1
+4,Infrequent driving,0,5700,60,3.5,1,7,6:00 PM,7:00 AM,80%,1629,4,73%,7%,1,0.6
+5,Scheduled charging,0,9435,60,3.5,1,7,10:00 PM,9:00 AM,80%,2696,7,68%,12%,1,1
+6,Always plugged-in,0,0,60,3.5,1,7,12:00 AM,11:59 PM,80%,2696,7,68%,12%,1,1
